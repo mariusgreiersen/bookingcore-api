@@ -1,0 +1,95 @@
+spring:
+  application:
+    name: bookingcore-api
+
+  datasource:
+    # Local-development defaults match docker-compose.yml. Override via environment in any shared environment.
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/bookingcore}
+    username: ${DB_USERNAME:bookingcore}
+    password: ${DB_PASSWORD:bookingcore}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema; Hibernate only verifies that the entity mappings match it.
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    locations: classpath:db/migration
+    # The demo seed (db/seed) is the only repeatable migration. Without this, starting without the "demo" profile
+    # against a database that was seeded earlier fails validation. Missing *versioned* migrations still fail.
+    ignore-migration-patterns: "repeatable:missing"
+
+  data:
+    web:
+      pageable:
+        default-page-size: 20
+        max-page-size: 100
+
+  jackson:
+    time-zone: UTC
+
+  web:
+    resources:
+      # Pure API: no static content. Unknown paths then produce a NoHandlerFoundException, which is rendered
+      # as Problem Details by GlobalExceptionHandler. Swagger UI registers its own resource handlers.
+      add-mappings: false
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+  error:
+    include-stacktrace: never
+    include-message: never
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+      probes:
+        enabled: true
+  info:
+    env:
+      enabled: true
+
+info:
+  app:
+    name: BookingCore API
+    version: '@project.version@'
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    operations-sorter: method
+    tags-sorter: alpha
+  default-produces-media-type: application/json
+
+logging:
+  pattern:
+    correlation: '[%X{requestId:-}] '
+  level:
+    com.bookingcore: INFO
+    # Hibernate logs every rejected statement at WARN, including expected booking conflicts (SQLSTATE 23P01).
+    # Those are handled and logged by the application; genuine failures are logged by GlobalExceptionHandler.
+    org.hibernate.orm.jdbc.error: ERROR
+
+---
+# Demo profile: loads sample rooms and reservations for local exploration.
+# Seed data lives in a separate Flyway location and is never applied unless this profile is active.
+spring:
+  config:
+    activate:
+      on-profile: demo
+  flyway:
+    locations: classpath:db/migration,classpath:db/seed
