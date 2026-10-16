@@ -1,37 +1,65 @@
 # BookingCore API
 
-A reservation backend for limited-availability resources such as meeting rooms, built with Java 21,
-Spring Boot 4 and PostgreSQL.
+**A booking system for meeting rooms, built so that the same room can never be booked twice at the same
+time, even when two people press "Book" at the exact same moment.**
 
-Its central guarantee: **a resource can never be double-booked, even when conflicting requests arrive at the same
-instant on several application instances.** PostgreSQL enforces this with an exclusion constraint, and integration
-tests check it by racing real HTTP requests against a real database.
+Java 21 · Spring Boot 4 · PostgreSQL · Docker · Testcontainers
+
+## What is this?
+
+BookingCore is the **backend** of a room-booking system: the part that stores the rooms and bookings and decides
+whether a booking is allowed. It has no web page of its own. Apps and websites talk to it through a **REST API**,
+and you can try every feature in the browser through the built-in [Swagger UI](#quick-start).
+
+What it can do:
+
+- **Rooms:** add rooms (name, location, number of seats), list and search them, edit them, or take them out of
+  service.
+- **Bookings:** book a room for a time slot, view, change or cancel bookings, and search them by room, status or
+  date.
+- **Availability:** ask "is this room free between 10:00 and 11:00?"
+
+The rules:
+
+| Situation | Result |
+|---|---|
+| Alex books Room A 10:00–11:00 | ✅ Booked |
+| Sam tries Room A 10:30–11:30 | ❌ Rejected: the room is already taken (`409 Conflict`) |
+| Sam books Room A 11:00–12:00 | ✅ Booked: back-to-back bookings are fine |
+| Alex cancels, then Sam books 10:00–11:00 | ✅ Booked: cancelling frees the slot (the old booking is kept for history) |
+| Alex and Sam book Room A 10:00–11:00 **at the exact same moment** | ✅ exactly one succeeds, ❌ the other is rejected |
+
+## The main challenge: two people booking at the same moment
+
+The obvious way to build booking is: *check whether the room is free, and if so, save the booking.* But if two
+requests arrive at the same instant, **both checks can run before either booking is saved**. Both see a free
+room, both save, and the room is double-booked. It's like two people each checking that a seat is empty, then
+both sitting down on it.
+
+BookingCore solves this by putting the rule **inside the database**: *"no two confirmed bookings for the same room
+may overlap in time."* The database checks this rule at the moment it saves each booking, so it cannot be fooled
+by timing. The losing request gets a clear "already booked" answer. Because the rule lives in the database, it
+still holds when several copies of the app run on different servers.
+
+**Proof:** automated tests fire up to 16 bookings at the same instant against a real database, over and over, and
+check that there is never an overlap. A manual demo against the running app gives:
 
 ```text
-20 simultaneous requests for the same room and hour  →  1 × 201 Created, 19 × 409 Conflict, 1 row in PostgreSQL
+20 simultaneous requests for the same room and hour  →  1 booked, 19 rejected, 1 booking stored
 ```
 
-## Overview
+The [technical deep dive](#concurrency-and-double-booking-prevention) below explains exactly how this works,
+including a deadlock the tests uncovered and how it was fixed.
 
-Each room holds **at most one confirmed reservation at any moment**. Capacity is the maximum number of attendees,
-not a number of parallel bookings.
+## Highlights for reviewers
 
-| Scenario | Result |
-|---|---|
-| A books Room A 10:00–11:00 | `201 Created` |
-| B books Room A 10:30–11:30 | `409 Conflict` (overlap) |
-| B books Room A 11:00–12:00 | `201 Created` (back-to-back is allowed) |
-| A cancels, then B books 10:00–11:00 | `201 Created` (cancelling frees the slot) |
-| A and B book Room A 10:00–11:00 **at the same instant** | exactly one `201`, the other `409` |
-
-**Features**
-- Resources: create, read, list with filters (`active`, `minCapacity`, `location`), partial update, deactivation.
-- Reservations: create, read, list with filters, partial update (re-checked for conflicts), and idempotent
-  cancellation that keeps history.
-- Informational availability check that returns busy intervals without customer data.
-- RFC 9457 Problem Details errors with a stable `code` and `requestId`. Stack traces and SQL are never returned.
-- ISO 8601 timestamps with a required offset, stored as `timestamptz`, returned in UTC.
-- Correlation IDs in every log line, no customer data in logs, Actuator health and readiness probes only.
+- **Correctness under concurrency:** a PostgreSQL exclusion constraint guarantees no overlaps, verified by
+  concurrent integration tests against real PostgreSQL (Testcontainers).
+- **Clean REST API:** versioned endpoints, validation, pagination, correct status codes, and consistent
+  RFC 9457 error responses.
+- **Thorough testing:** 136 automated tests (unit, controller and integration), with 95% line coverage.
+- **Production habits:** Flyway migrations, Docker Compose setup, CI on GitHub Actions, request IDs in logs, no
+  customer data in logs, and health checks.
 
 ## Technology stack
 
@@ -141,10 +169,10 @@ sequenceDiagram
     participant A as Request A
     participant B as Request B
     participant DB as PostgreSQL
-    A->>DB: BEGIN; SELECT resource FOR NO KEY UPDATE
-    B->>DB: BEGIN; SELECT resource FOR NO KEY UPDATE
+    A->>DB: BEGIN, then SELECT resource FOR NO KEY UPDATE
+    B->>DB: BEGIN, then SELECT resource FOR NO KEY UPDATE
     Note over B,DB: B waits for A's row lock
-    A->>DB: INSERT 10:00–11:00 (constraint OK); COMMIT
+    A->>DB: INSERT 10:00–11:00 (constraint OK), then COMMIT
     DB-->>A: 201 Created
     DB-->>B: lock granted
     B->>DB: INSERT 10:00–11:00
